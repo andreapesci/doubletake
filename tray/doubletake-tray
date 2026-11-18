@@ -1,0 +1,913 @@
+#!/usr/bin/python3
+"""GTK tray for the existing DoubleTake daemon and control client."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as Indicator
+except (ImportError, ValueError):
+    Indicator = None
+
+
+ICON = "video-display"
+APP_ID = "io.github.jmh_zero.DoubleTake"
+SETTINGS_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "doubletake/tray.json"
+FPS_RANGE = (10, 60)
+BITRATE_MAX = 12000  # kbps; the daemon's encoder limit. 0 lets the daemon choose.
+SETTINGS_APPLY_DELAY_MS = 1200
+STATES = {
+    "connecting": "Connessione in corso",
+    "pin_required": "Autenticazione richiesta",
+    "streaming": "Trasmissione in corso",
+}
+
+
+def binary(name):
+    sibling = Path(__file__).resolve().with_name(name)
+    if os.access(sibling, os.X_OK):
+        return str(sibling)
+    return shutil.which(name)
+
+
+def default_settings(vaapi_quality_1080p):
+    if vaapi_quality_1080p:
+        return {"fps": 24, "bitrate": 12000, "mute_local": True}
+    return {"fps": 30, "bitrate": 0, "mute_local": True}
+
+
+def load_settings(path, defaults):
+    settings = dict(defaults)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return settings
+    if not isinstance(data, dict):
+        return settings
+    fps, bitrate, mute = data.get("fps"), data.get("bitrate"), data.get("mute_local")
+    if type(fps) is int and FPS_RANGE[0] <= fps <= FPS_RANGE[1]:
+        settings["fps"] = fps
+    if type(bitrate) is int and 0 <= bitrate <= BITRATE_MAX:
+        settings["bitrate"] = bitrate
+    if type(mute) is bool:
+        settings["mute_local"] = mute
+    return settings
+
+
+def save_settings(path, settings):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def stream_args(settings):
+    args = ["-fps", str(settings["fps"])]
+    if settings["bitrate"] > 0:
+        args.extend(["-bitrate", str(settings["bitrate"])])
+    return args
+
+
+VIRTUAL_SINK = "doubletake_receiver"
+
+
+class LocalAudio:
+    """Sends the computer's audio only to the receiver while mirroring.
+
+    The sender captures the default sink's monitor. Leaving that sink on the
+    sound card plays everything on the speakers too and keeps the card awake for
+    the whole session (on MacBooks the headphone jack's optical LED stays lit).
+    A null sink made default for the session feeds the capture alone, so the
+    card can power down. PipeWire's null sink has no volume control: the
+    receiver gets full-scale audio and its own remote sets the level, as with
+    AirPlay from Apple devices.
+    """
+
+    def __init__(self):
+        self.module = None
+        self.previous_sink = None
+
+    @staticmethod
+    def pactl(*args):
+        return subprocess.run(
+            ["pactl", *args], capture_output=True, text=True, check=True, timeout=4,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout
+
+    def divert(self):
+        if self.module is not None:
+            return
+        self.remove_stale()
+        previous = self.pactl("get-default-sink").strip()
+        module = self.pactl(
+            "load-module", "module-null-sink", f"sink_name={VIRTUAL_SINK}",
+            "sink_properties=device.description=DoubleTake",
+        ).strip()
+        self.module, self.previous_sink = module, previous
+        self.pactl("set-default-sink", VIRTUAL_SINK)
+        self.move_streams(VIRTUAL_SINK)
+
+    def restore(self):
+        module, previous = self.module, self.previous_sink
+        self.module = self.previous_sink = None
+        if module is None:
+            return
+        if previous:
+            self.pactl("set-default-sink", previous)
+            self.move_streams(previous)
+        self.pactl("unload-module", module)
+
+    def move_streams(self, sink):
+        for line in self.pactl("list", "short", "sink-inputs").splitlines():
+            stream = line.split("\t", 1)[0]
+            if stream.isdigit():
+                try:
+                    self.pactl("move-sink-input", stream, sink)
+                except subprocess.CalledProcessError:
+                    pass  # the stream ended in the meantime
+
+    def remove_stale(self):
+        # A tray that exited without restoring leaves its sink behind.
+        for line in self.pactl("list", "short", "modules").splitlines():
+            fields = line.split("\t")
+            if len(fields) > 2 and fields[1] == "module-null-sink" and f"sink_name={VIRTUAL_SINK}" in fields[2]:
+                self.pactl("unload-module", fields[0])
+
+
+class DisplayMode:
+    MIRROR_MODE = "1920x1080"
+
+    def __init__(self):
+        self.previous = None
+
+    @staticmethod
+    def xrandr(*args):
+        return subprocess.run(
+            ["xrandr", *args], capture_output=True, text=True, check=True, timeout=4,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout
+
+    def internal_panel(self):
+        lines = self.xrandr("--current").splitlines()
+        outputs = [
+            (index, match[1])
+            for index, line in enumerate(lines)
+            if (match := re.match(r"^(\S+) connected (?:primary )?\d+x\d+[+-]\d+[+-]\d+", line))
+        ]
+        if len(outputs) != 1 or not outputs[0][1].startswith(("eDP", "LVDS")):
+            return None
+        index, name = outputs[0]
+        modes = set()
+        current = None
+        for line in lines[index + 1:]:
+            if not line.startswith(" "):
+                break
+            parts = line.split()
+            if not parts:
+                continue
+            mode, *rates = parts
+            modes.add(mode)
+            for rate in rates:
+                if "*" in rate:
+                    current = (mode, rate.rstrip("*+"))
+        return (name, current, modes) if current else None
+
+    def use_mirror_mode(self):
+        if self.previous is not None:
+            return
+        panel = self.internal_panel()
+        if panel is None:
+            return
+        name, (mode, rate), modes = panel
+        if mode == self.MIRROR_MODE or self.MIRROR_MODE not in modes:
+            return
+        self.previous = (name, mode, rate)
+        self.xrandr("--output", name, "--mode", self.MIRROR_MODE, "--rate", rate)
+
+    def restore(self):
+        if self.previous is None:
+            return
+        name, mode, rate = self.previous
+        panel = self.internal_panel()
+        # Respect manual changes and leave multi-monitor layouts alone.
+        if panel and panel[0] == name and panel[1][0] == self.MIRROR_MODE:
+            self.xrandr("--output", name, "--mode", mode, "--rate", rate)
+        self.previous = None
+
+
+class ReceiverPopup(Gtk.Window):
+    ROW_HEIGHT = 54
+    WIDTH = 350
+
+    def __init__(self, tray):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.tray = tray
+        self.grabbed_seat = None
+        self.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
+        self.set_default_size(self.WIDTH, -1)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("button-press-event", self.handle_button)
+        self.connect("key-press-event", self.handle_key)
+        self.connect("hide", self.release_grab)
+
+        frame = Gtk.Frame(shadow_type=Gtk.ShadowType.OUT)
+        self.add(frame)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=10)
+        frame.add(content)
+
+        self.status = Gtk.Label(xalign=0)
+        content.pack_start(self.status, False, False, 0)
+        self.receivers = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.empty = Gtk.Label()
+        self.receivers.set_placeholder(self.empty)
+        self.scroll = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            min_content_height=3 * self.ROW_HEIGHT + 8,
+            shadow_type=Gtk.ShadowType.IN,
+        )
+        self.scroll.add(self.receivers)
+        content.pack_start(self.scroll, True, True, 0)
+        content.pack_start(self.build_settings(tray.settings), False, False, 0)
+
+        actions = Gtk.Box(spacing=8)
+        self.refresh = Gtk.Button(label="Aggiorna ricevitori")
+        self.refresh.connect("clicked", lambda _button: tray.refresh())
+        actions.pack_start(self.refresh, False, False, 0)
+        self.quit_button = Gtk.Button(label="Esci da DoubleTake")
+        self.quit_button.connect("clicked", lambda _button: tray.stop())
+        actions.pack_end(self.quit_button, False, False, 0)
+        content.pack_start(actions, False, False, 0)
+
+    def build_settings(self, settings):
+        # Spin buttons keep every control inside this grabbed popup; a combo box
+        # would open a second popup window outside it.
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        heading = Gtk.Label(xalign=0)
+        heading.set_markup("<b>Qualità della trasmissione</b>")
+        grid.attach(heading, 0, 0, 2, 1)
+
+        self.fps = Gtk.SpinButton.new_with_range(*FPS_RANGE, 1)
+        self.fps.set_value(settings["fps"])
+        grid.attach(Gtk.Label(label="Fotogrammi al secondo", xalign=0, hexpand=True), 0, 1, 1, 1)
+        grid.attach(self.fps, 1, 1, 1, 1)
+
+        self.bitrate = Gtk.SpinButton.new_with_range(0, BITRATE_MAX / 1000, 0.5)
+        self.bitrate.set_digits(1)
+        self.bitrate.set_value(settings["bitrate"] / 1000)
+        bitrate_label = Gtk.Label(label="Bitrate (Mbit/s, 0 = automatico)", xalign=0, hexpand=True)
+        grid.attach(bitrate_label, 0, 2, 1, 1)
+        grid.attach(self.bitrate, 1, 2, 1, 1)
+
+        self.mute_local = Gtk.CheckButton(label="Durante la trasmissione, audio solo sulla TV")
+        self.mute_local.set_active(settings["mute_local"])
+        grid.attach(self.mute_local, 0, 3, 2, 1)
+
+        for widget, signal_name in ((self.fps, "value-changed"), (self.bitrate, "value-changed"),
+                                    (self.mute_local, "toggled")):
+            widget.connect(signal_name, lambda *_args: self.tray.change_settings(self.current_settings()))
+        return grid
+
+    def current_settings(self):
+        return {
+            "fps": self.fps.get_value_as_int(),
+            "bitrate": round(self.bitrate.get_value() * 1000),
+            "mute_local": self.mute_local.get_active(),
+        }
+
+    def open_at_icon(self, icon):
+        display = self.get_display()
+        seat = display.get_default_seat()
+        found, _screen, area, orientation = icon.get_geometry()
+        if not found:
+            _screen, pointer_x, pointer_y = seat.get_pointer().get_position()
+            area = Gdk.Rectangle()
+            area.x, area.y = pointer_x, pointer_y
+            orientation = Gtk.Orientation.HORIZONTAL
+
+        monitor = display.get_monitor_at_point(area.x + area.width // 2, area.y + area.height // 2)
+        work = monitor.get_workarea()
+        frame = self.get_child()
+        frame.show_all()
+        _, natural = frame.get_preferred_size()
+        width = max(self.WIDTH, natural.width)
+        height = natural.height
+        if orientation == Gtk.Orientation.VERTICAL:
+            x = area.x - width if area.x - width >= work.x else area.x + area.width
+            y = area.y
+        else:
+            x = area.x + area.width - width
+            y = area.y - height if area.y - height >= work.y else area.y + area.height
+        x = max(work.x, min(x, work.x + work.width - width))
+        y = max(work.y, min(y, work.y + work.height - height))
+        self.resize(width, height)
+        self.move(x, y)
+        self.show()
+        if seat.grab(self.get_window(), Gdk.SeatCapabilities.ALL, True) == Gdk.GrabStatus.SUCCESS:
+            self.grabbed_seat = seat
+
+    def release_grab(self, _window):
+        if self.grabbed_seat is not None:
+            self.grabbed_seat.ungrab()
+            self.grabbed_seat = None
+
+    def handle_button(self, _window, event):
+        x, y = self.get_position()
+        width, height = self.get_size()
+        if x <= event.x_root < x + width and y <= event.y_root < y + height:
+            return False
+        self.hide()
+        return True
+
+    def handle_key(self, _window, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        return False
+
+    def update(self, entries, status, empty_text, actions_enabled, refresh_enabled, stopping):
+        self.status.set_text(status)
+        self.empty.set_text(empty_text)
+        self.refresh.set_sensitive(refresh_enabled)
+        self.quit_button.set_sensitive(not stopping)
+        # Keep focus and scroll position when only the status text changes.
+        rows = (entries, actions_enabled)
+        if rows == getattr(self, "displayed_rows", None):
+            return
+        self.displayed_rows = rows
+        for child in self.receivers.get_children():
+            child.destroy()
+        for addr, name, stream in entries:
+            row = Gtk.Box(spacing=12)
+            row.set_size_request(-1, self.ROW_HEIGHT - 4)
+            row.set_margin_start(10)
+            row.set_margin_end(10)
+            details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+            title = Gtk.Label(label=name, xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            details.add(title)
+            description = STATES.get(stream["state"], stream["state"]) if stream else addr
+            subtitle = Gtk.Label(label=description, xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            subtitle.get_style_context().add_class("dim-label")
+            details.add(subtitle)
+            row.pack_start(details, True, True, 0)
+
+            if stream:
+                label, action = "Scollega", self.tray.disconnect_receiver
+                if stream["state"] == "pin_required":
+                    pin = Gtk.Button(label="Inserisci codice", valign=Gtk.Align.CENTER)
+                    pin.connect("clicked", lambda _button, stream=stream: self.tray.ask_credential(stream))
+                    pin.set_sensitive(actions_enabled)
+                    row.pack_start(pin, False, False, 0)
+            else:
+                label, action = "Collega", self.tray.connect_receiver
+            button = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+            button.set_sensitive(actions_enabled)
+            button.connect("clicked", lambda _button, action=action, addr=addr: action(addr))
+            row.pack_end(button, False, False, 0)
+            self.receivers.add(row)
+        self.receivers.show_all()
+
+
+class Tray(Gtk.Application):
+    def __init__(self, vaapi_quality_1080p=False):
+        super().__init__(application_id=APP_ID)
+        self.vaapi_quality_1080p = vaapi_quality_1080p
+        self.display_mode = DisplayMode() if vaapi_quality_1080p else None
+        self.daemon = None
+        self.ready = False
+        self.stopping = False
+        self.busy = False
+        self.checking = False
+        self.command_generation = 0
+        self.refresh_pending = False
+        self.status_source = 0
+        self.streams = []
+        self.devices = []
+        self.last_error = ""
+        self.status_text = "Pronto"
+        self.prompt = None
+        self.log_path = None
+        self.popup = None
+        self.settings_path = SETTINGS_PATH
+        self.settings = load_settings(self.settings_path, default_settings(vaapi_quality_1080p))
+        # The fps and bitrate the tray-owned daemon was started with.
+        self.daemon_settings = None
+        self.settings_source = 0
+        self.local_audio = LocalAudio()
+
+    def daemon_args(self):
+        args = [binary("doubletake"), "-daemonize", "-discover-on-demand"]
+        if self.vaapi_quality_1080p:
+            args.extend(["-video-codec", "h264", "-hwaccel", "vaapi-legacy-quality"])
+        return args + stream_args(self.settings)
+
+    def change_settings(self, settings):
+        restart = (settings["fps"], settings["bitrate"]) != (self.settings["fps"], self.settings["bitrate"])
+        self.settings = settings
+        try:
+            save_settings(self.settings_path, settings)
+        except OSError as error:
+            self.show_error(f"Impossibile salvare le impostazioni. {error}")
+        if not restart:
+            return
+        # Spin buttons report every step; apply once the value settles.
+        if self.settings_source:
+            GLib.source_remove(self.settings_source)
+        self.settings_source = GLib.timeout_add(SETTINGS_APPLY_DELAY_MS, self.apply_settings)
+
+    def settings_pending(self):
+        current = (self.settings["fps"], self.settings["bitrate"])
+        return self.daemon_settings is not None and current != self.daemon_settings
+
+    def apply_settings(self):
+        self.settings_source = 0
+        if self.stopping:
+            return GLib.SOURCE_REMOVE
+        if self.daemon is None or self.daemon.poll() is not None:
+            # A daemon this tray did not start keeps the options it was given.
+            if self.ready:
+                self.status_text = "Impostazioni salvate · valgono al prossimo avvio del servizio"
+                self.render()
+            return GLib.SOURCE_REMOVE
+        if not self.settings_pending():
+            return GLib.SOURCE_REMOVE
+        if self.streams or self.busy:
+            self.status_text = "Nuove impostazioni dalla prossima connessione"
+            self.render()
+        else:
+            self.restart_daemon()
+        return GLib.SOURCE_REMOVE
+
+    def restart_daemon(self):
+        daemon = self.daemon
+        self.busy = True
+        self.status_text = "Applicazione delle impostazioni…"
+        self.render()
+        daemon.terminate()
+        deadline = time.monotonic() + 15
+
+        def wait():
+            if daemon.poll() is None and time.monotonic() < deadline:
+                return GLib.SOURCE_CONTINUE
+            if daemon.poll() is None:
+                try:
+                    os.killpg(daemon.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                daemon.wait()
+            self.daemon = None
+            self.daemon_settings = None
+            self.busy = self.ready = False
+            if not self.stopping:
+                self.start()
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(100, wait)
+
+    def do_activate(self):
+        if hasattr(self, "icon"):
+            return
+        self.hold()
+        # XEmbed gives us the click directly on Cinnamon and XFCE under X11.
+        on_x11 = Gdk.Display.get_default().__gtype__.name == "GdkX11Display"
+        self.use_indicator = Indicator is not None and not on_x11
+        if not on_x11:
+            self.display_mode = None
+        if self.use_indicator:
+            self.menu = Gtk.Menu()
+            self.icon = Indicator.Indicator.new(APP_ID, ICON, Indicator.IndicatorCategory.APPLICATION_STATUS)
+            self.icon.set_title("DoubleTake")
+            self.icon.set_menu(self.menu)
+            self.icon.set_status(Indicator.IndicatorStatus.ACTIVE)
+        else:
+            self.icon = Gtk.StatusIcon.new_from_icon_name(ICON)
+            self.icon.set_title("DoubleTake")
+            self.icon.connect("popup-menu", lambda *_args: self.toggle_popup())
+            self.icon.connect("activate", lambda _icon: self.toggle_popup())
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.stop)
+        self.render()
+
+    def toggle_popup(self):
+        if self.popup is not None and self.popup.get_visible():
+            self.popup.hide()
+            return
+        if self.prompt:
+            self.prompt[1].present()
+            return
+        # Build a fresh popup on every open. The 1080p mirror mode switches the
+        # desktop between 2x and 1x scaling, and a popup realized at the other
+        # scale keeps drawing into a surface of its old size: it reopens partly
+        # black, with its rows and buttons cut off.
+        if self.popup is not None:
+            self.popup.destroy()
+        self.popup = ReceiverPopup(self)
+        self.render()
+        self.popup.open_at_icon(self.icon)
+        self.refresh()
+
+    def render(self):
+        active = {stream["device_ip"]: stream for stream in self.streams}
+        devices = {device["ip"]: device["name"] for device in self.devices}
+        for addr, stream in active.items():
+            devices.setdefault(addr, stream.get("device") or addr)
+        entries = [
+            (addr, name, active.get(addr))
+            for addr, name in sorted(devices.items(), key=lambda entry: entry[1].casefold())
+        ]
+        actions_enabled = not self.busy and not self.checking and not self.stopping
+        refresh_enabled = actions_enabled and not self.prompt
+        empty_text = "Nessun ricevitore AirPlay rilevato" if self.ready and not self.busy else ""
+        if not self.use_indicator:
+            self.icon.set_tooltip_text(f"DoubleTake · {self.status_text}")
+            if self.popup:
+                self.popup.update(entries, self.status_text, empty_text, actions_enabled, refresh_enabled, self.stopping)
+            return
+
+        for child in self.menu.get_children():
+            child.destroy()
+
+        def item(label, action=None):
+            entry = Gtk.MenuItem(label=label)
+            if action:
+                entry.connect("activate", lambda _entry: action())
+            else:
+                entry.set_sensitive(False)
+            self.menu.append(entry)
+
+        item(self.status_text)
+        if empty_text and not entries:
+            item(empty_text)
+        for addr, name, stream in entries:
+            label = f"{name} ({addr})" if name != addr else addr
+            if stream is None:
+                action = lambda addr=addr: self.connect_receiver(addr)
+                item(f"Collega a {label}", action if actions_enabled else None)
+                continue
+            state = STATES.get(stream["state"], stream["state"])
+            item(f"{label} · {state}")
+            if stream["state"] == "pin_required":
+                item(f"Inserisci codice per {name}", lambda stream=stream: self.ask_credential(stream))
+            action = lambda addr=addr: self.disconnect_receiver(addr)
+            item(f"Scollega {name}", action if actions_enabled else None)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+        item(
+            "Aggiorna ricevitori" if self.ready else "Cerca ricevitori AirPlay",
+            self.refresh if refresh_enabled else None,
+        )
+        item("Esci", self.stop)
+        self.menu.show_all()
+
+    def request(self, args, callback, credential=None):
+        ctl = binary("doubletake-ctl")
+        if not ctl:
+            callback(None, "Impossibile trovare doubletake-ctl.")
+            return
+        options = ["-credential-stdin"] if credential is not None else []
+        flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        if credential is not None:
+            flags |= Gio.SubprocessFlags.STDIN_PIPE
+        try:
+            process = Gio.Subprocess.new([ctl, *options, *args], flags)
+        except GLib.Error as error:
+            callback(None, error.message)
+            return
+
+        def complete(process, result):
+            if self.stopping:
+                return
+            try:
+                _, stdout, stderr = process.communicate_utf8_finish(result)
+                response = json.loads(stdout) if stdout else None
+            except (GLib.Error, ValueError) as error:
+                callback(None, str(error))
+                return
+            if response and response.get("ok"):
+                callback(response, None)
+            else:
+                error = response.get("error") if response else stderr.strip()
+                callback(None, error or "Il servizio DoubleTake non ha risposto.")
+
+        process.communicate_utf8_async(credential, None, complete)
+
+    def start(self):
+        if self.checking:
+            return
+        if not binary("doubletake-ctl") or not binary("doubletake"):
+            self.unavailable("Impossibile trovare doubletake o doubletake-ctl.")
+            return
+        self.checking = True
+        if not self.ready:
+            self.status_text = "Avvio di DoubleTake…"
+        self.render()
+        self.request(["status"], self.start_if_needed)
+
+    def start_if_needed(self, response, _error):
+        if response:
+            self.started(response)
+            return
+        try:
+            if self.daemon is None or self.daemon.poll() is not None:
+                state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+                self.log_path = state / "doubletake/tray-daemon.log"
+                self.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                env = None
+                if self.vaapi_quality_1080p:
+                    env = {**os.environ, "LIBVA_DRIVER_NAME": "i965"}
+                with os.fdopen(fd, "w") as log:
+                    self.daemon = subprocess.Popen(
+                        self.daemon_args(), env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                        start_new_session=True,
+                    )
+                self.daemon_settings = (self.settings["fps"], self.settings["bitrate"])
+        except OSError as error:
+            self.unavailable(str(error))
+            return
+
+        deadline = time.monotonic() + 4
+
+        def probe():
+            if not self.stopping:
+                self.request(["status"], complete)
+            return GLib.SOURCE_REMOVE
+
+        def complete(response, error):
+            if response:
+                if self.daemon.poll() is not None:
+                    self.daemon = None
+                self.started(response)
+            elif time.monotonic() < deadline:
+                GLib.timeout_add(250, probe)
+            else:
+                self.unavailable(f"{error}\nRegistro: {self.log_path}")
+
+        probe()
+
+    def started(self, response):
+        self.ready = True
+        self.refresh_pending = False
+        self.apply_status(response)
+        self.command(["discover"], "Ricerca dei ricevitori AirPlay…")
+
+    def unavailable(self, error):
+        self.ready = self.checking = False
+        self.refresh_pending = False
+        self.streams = []
+        self.devices = []
+        self.status_text = "Servizio DoubleTake non disponibile"
+        self.close_prompt()
+        self.restore_display()
+        self.restore_audio()
+        self.render()
+        self.show_error(error)
+
+    def check_status(self):
+        if self.ready and not self.checking and not self.busy:
+            self.checking = True
+            generation = self.command_generation
+            self.request(["status"], lambda response, error: self.status_received(response, error, generation))
+
+    def monitor_status(self):
+        if not self.streams or self.stopping:
+            self.status_source = 0
+            return GLib.SOURCE_REMOVE
+        self.check_status()
+        return GLib.SOURCE_CONTINUE
+
+    def status_received(self, response, error, generation):
+        if self.busy or generation != self.command_generation:
+            self.checking = False
+            self.check_status()
+            return
+        if error:
+            self.unavailable(error)
+        else:
+            self.apply_status(response)
+            if self.refresh_pending:
+                self.refresh()
+
+    def apply_status(self, response):
+        self.checking = False
+        streams = response.get("streams") or []
+        status = STATES.get(response["state"], "Pronto")
+        error = response.get("error", "")
+        if error and not streams:
+            status = "Ultima connessione non riuscita"
+        if self.daemon is None:
+            status += " · servizio esterno"
+        if streams != self.streams or status != self.status_text:
+            self.streams, self.status_text = streams, status
+            self.render()
+        if streams and not self.status_source:
+            self.status_source = GLib.timeout_add_seconds(2, self.monitor_status)
+        if not streams:
+            self.restore_display()
+            self.restore_audio()
+            if self.settings_pending() and not self.settings_source:
+                self.settings_source = GLib.idle_add(self.apply_settings)
+        if error and error != self.last_error:
+            self.show_error(error)
+        self.last_error = error
+
+        waiting = [stream for stream in streams if stream["state"] == "pin_required"]
+        if self.prompt and self.prompt[0] not in {stream["device_ip"] for stream in waiting}:
+            self.close_prompt()
+        if waiting and not self.prompt:
+            self.ask_credential(waiting[0])
+
+    def refresh(self):
+        if self.busy or self.prompt or self.stopping:
+            return
+        self.refresh_pending = self.checking
+        if not self.checking:
+            self.start()
+
+    def connect_receiver(self, addr):
+        if self.busy or self.stopping or not self.ready:
+            return
+        if self.display_mode and self.daemon is not None and self.daemon.poll() is None and not self.streams:
+            if self.popup:
+                self.popup.hide()
+            try:
+                self.display_mode.use_mirror_mode()
+            except (OSError, subprocess.SubprocessError) as error:
+                self.show_error(f"Impossibile impostare lo schermo a 1920×1080. {error}")
+        if self.settings["mute_local"]:
+            try:
+                self.local_audio.divert()
+            except (OSError, subprocess.SubprocessError) as error:
+                self.show_error(f"Impossibile deviare l'audio verso la TV. {error}")
+        self.command(["connect", addr], "Connessione in corso…")
+
+    def restore_audio(self):
+        try:
+            self.local_audio.restore()
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Impossibile ripristinare l'audio del computer. {error}", file=sys.stderr)
+
+    def restore_display(self):
+        if self.display_mode:
+            if self.display_mode.previous is not None and self.popup:
+                self.popup.hide()
+            try:
+                self.display_mode.restore()
+            except (OSError, subprocess.SubprocessError) as error:
+                message = f"Impossibile ripristinare la risoluzione dello schermo. {error}"
+                if self.stopping:
+                    print(message, file=sys.stderr)
+                else:
+                    self.show_error(message)
+
+    def disconnect_receiver(self, addr):
+        self.command(["disconnect", addr], "Disconnessione in corso…")
+
+    def command(self, args, message, credential=None):
+        if self.busy or self.stopping or not self.ready:
+            return
+        self.busy = True
+        self.command_generation += 1
+        self.status_text = message
+        self.render()
+
+        def complete(response, error):
+            self.busy = False
+            if error:
+                self.show_error(error)
+            elif args[0] == "discover":
+                self.devices = response.get("devices") or []
+            self.render()
+            self.check_status()
+
+        self.request(args, complete, credential)
+
+    def ask_credential(self, stream):
+        if self.prompt:
+            self.prompt[1].present()
+            return
+        addr = stream["device_ip"]
+        name = stream.get("device") or addr
+        password = stream.get("credential_kind") == "password"
+        label = "Password AirPlay" if password else "PIN AirPlay"
+        instruction = "Inserisci la password del ricevitore." if password else "Inserisci il PIN mostrato sulla TV."
+        dialog = Gtk.Dialog(title=f"{label} · {name}")
+        dialog.set_application(self)
+        if self.popup:
+            self.popup.hide()
+        dialog.set_modal(True)
+        dialog.set_position(Gtk.WindowPosition.CENTER)
+        dialog.add_button("Annulla e scollega", Gtk.ResponseType.CANCEL)
+        submit = dialog.add_button("Continua", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        entry = Gtk.Entry(visibility=False, activates_default=True)
+        if not password:
+            entry.set_max_length(4)
+            entry.set_input_purpose(Gtk.InputPurpose.PIN)
+        area = dialog.get_content_area()
+        area.set_border_width(16)
+        area.set_spacing(8)
+        area.add(Gtk.Label(label=instruction))
+        area.add(entry)
+
+        def validate(entry):
+            value = entry.get_text()
+            valid = bool(value) if password else len(value) == 4 and value.isascii() and value.isdigit()
+            submit.set_sensitive(valid)
+
+        def reply(_dialog, result):
+            credential = entry.get_text()
+            self.close_prompt()
+            if result == Gtk.ResponseType.OK:
+                self.command(["connect", addr], "Verifica delle credenziali…", credential)
+            else:
+                self.disconnect_receiver(addr)
+
+        entry.connect("changed", validate)
+        dialog.connect("response", reply)
+        validate(entry)
+        self.prompt = (addr, dialog)
+        self.render()
+        dialog.show_all()
+        dialog.present()
+
+    def close_prompt(self):
+        if self.prompt:
+            _, dialog = self.prompt
+            self.prompt = None
+            dialog.destroy()
+
+    def show_error(self, error):
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE,
+            text="DoubleTake",
+        )
+        dialog.set_application(self)
+        if self.popup:
+            self.popup.hide()
+        dialog.format_secondary_text(error)
+        dialog.connect("response", lambda dialog, _response: dialog.destroy())
+        dialog.show()
+
+    def stop(self):
+        if self.stopping:
+            return GLib.SOURCE_REMOVE
+        self.stopping = True
+        self.close_prompt()
+        if self.popup:
+            self.popup.hide()
+        if self.daemon is None or self.daemon.poll() is not None:
+            self.finish_stop()
+            return GLib.SOURCE_REMOVE
+
+        self.daemon.terminate()
+        deadline = time.monotonic() + 15
+
+        def wait():
+            if self.daemon.poll() is not None:
+                self.finish_stop()
+                return GLib.SOURCE_REMOVE
+            if time.monotonic() >= deadline:
+                try:
+                    os.killpg(self.daemon.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.daemon.wait()
+                self.finish_stop()
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+
+        self.status_text = "Arresto di DoubleTake…"
+        if self.use_indicator:
+            self.menu.set_sensitive(False)
+        self.render()
+        GLib.timeout_add(100, wait)
+        return GLib.SOURCE_REMOVE
+
+    def finish_stop(self):
+        self.restore_display()
+        self.restore_audio()
+        self.quit()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--vaapi-quality-1080p", action="store_true")
+    options, gtk_args = parser.parse_known_args(sys.argv[1:])
+    sys.exit(Tray(options.vaapi_quality_1080p).run([sys.argv[0], *gtk_args]))

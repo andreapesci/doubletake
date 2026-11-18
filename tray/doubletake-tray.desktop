@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DoubleTake
+Comment=Trasmetti lo schermo a un ricevitore AirPlay
+Exec=doubletake-tray
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;
+StartupNotify=false
