@@ -50,6 +50,9 @@ func TestPulseMonitorSourceSeparatesStallBufferFromFragment(t *testing.T) {
 		"device=test.monitor",
 		"buffer-time=250000",
 		"latency-time=7982",
+		// A stall must not leave captured samples with a permanent age.
+		"provide-clock=false",
+		"slave-method=re-timestamp",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("Pulse monitor source %q does not contain %q", args, want)
@@ -72,12 +75,12 @@ func TestAudioMonitorSourceSelection(t *testing.T) {
 		{
 			name: "Pulse monitor preferred when both plugins exist", hasPulse: true,
 			monitor: "test.monitor", hasPipeWire: true, wantSource: "pulse",
-			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982"},
+			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982", "provide-clock=false", "slave-method=re-timestamp"},
 		},
 		{
 			name: "native Pulse monitor", hasPulse: true,
 			monitor: "test.monitor", wantSource: "pulse",
-			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982"},
+			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982", "provide-clock=false", "slave-method=re-timestamp"},
 		},
 		{
 			name: "PipeWire fallback without Pulse plugin", hasPipeWire: true, wantSource: "pipewire",

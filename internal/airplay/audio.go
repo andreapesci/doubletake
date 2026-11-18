@@ -171,6 +171,14 @@ func pulseMonitorSourceArgs(monitor string, codec AudioCodec) []string {
 		// downstream queue cannot preserve samples that pulsesrc has not read.
 		fmt.Sprintf("buffer-time=%d", audioCaptureStallBuffer/time.Microsecond),
 		fmt.Sprintf("latency-time=%d", fragmentTime/time.Microsecond),
+		// Timestamp captured samples against the system clock that AirPlay
+		// timing uses. As clock provider, pulsesrc counts samples from its own
+		// clock: once a stall longer than buffer-time overruns the ring, every
+		// later sample keeps that lost interval as a permanent age, the sender
+		// judges all audio past its playout deadline, and the session goes silent
+		// while video continues. Re-timestamping resynchronizes after the stall.
+		"provide-clock=false",
+		"slave-method=re-timestamp",
 	}
 }
 
