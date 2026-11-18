@@ -303,12 +303,42 @@ func TestAudioCaptureUsesCompressedALAC(t *testing.T) {
 		codec:   AudioCodecALAC,
 	}
 	encoded := make([]byte, 8192)
-	n, _, err := capture.readFramePosition(encoded)
+	n, _, err := capture.readFramePosition(encoded, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n >= 1024 {
 		t.Fatalf("encoded length = %d, want a compressed ALAC packet", n)
+	}
+}
+
+func TestAudioCaptureEncodesSilenceWhileMuted(t *testing.T) {
+	pcm := testALACPCM()
+	capture := &AudioCapture{
+		pcmPipe: io.NopCloser(bytes.NewReader(bytes.Repeat(pcm, 3))),
+		waitCh:  make(chan struct{}),
+		codec:   AudioCodecALAC,
+	}
+	session := &MirrorSession{audioStream: &AudioStream{}}
+	var reference alacEncoder
+	encoded, want := make([]byte, 8192), make([]byte, 8192)
+	silence := make([]byte, len(pcm))
+	for index, muted := range []bool{false, true, false} {
+		if err := session.SetAudioMuted(muted); err != nil {
+			t.Fatal(err)
+		}
+		size, _, err := capture.readFramePosition(encoded, session.audioMuted.Load())
+		if err != nil {
+			t.Fatal(err)
+		}
+		samples := pcm
+		if muted {
+			samples = silence
+		}
+		wantSize := reference.Encode(want, samples)
+		if !bytes.Equal(encoded[:size], want[:wantSize]) {
+			t.Fatalf("frame %d does not encode the expected PCM (muted=%t)", index, muted)
+		}
 	}
 }
 

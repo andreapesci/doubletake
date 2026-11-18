@@ -82,8 +82,9 @@ Disable audio for video-only mirroring
 .TP
 .B \-hwaccel \fIMETHOD\fR
 Encoder preference: \fBauto\fR, \fBnvenc\fR (NVIDIA), \fBvaapi\fR
-(Intel/AMD), \fBopenh264\fR (software), or \fBnone\fR (x264, or x265 for
-forced HEVC).
+(Intel/AMD), \fBvaapi-legacy\fR (H.264 via \fBvaapih264enc\fR),
+\fBvaapi-legacy-quality\fR (legacy VA-API with CABAC and adaptive 8x8 transform),
+\fBopenh264\fR (software), or \fBnone\fR (x264, or x265 for forced HEVC).
 Only \fBauto\fR tries fallback encoders. An explicit method fails if its
 required GStreamer encoder is unavailable. The default is \fBauto\fR.
 .TP
@@ -99,6 +100,11 @@ Enable verbose protocol logging
 .B \-daemonize
 Run in daemon mode for multi-target control via
 .B doubletake-ctl
+.TP
+.B \-discover-on-demand
+In daemon mode, scan for AirPlay receivers only when
+.B doubletake-ctl discover
+requests a scan.
 .SH EXAMPLES
 .TP
 Discover and connect to any Apple TV on the network:

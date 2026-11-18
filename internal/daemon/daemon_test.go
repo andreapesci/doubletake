@@ -7,9 +7,96 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"doubletake/internal/airplay"
 )
+
+func TestOnDemandDiscoveryLeavesDaemonIdleBetweenScans(t *testing.T) {
+	d, err := New(Config{
+		SocketPath:       filepath.Join(t.TempDir(), "doubletake.sock"),
+		CredFile:         filepath.Join(t.TempDir(), "credentials.json"),
+		DiscoverOnDemand: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	waitForDaemonSocket(t, d.cfg.SocketPath)
+	assertIdle := func() {
+		t.Helper()
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.discovery != nil {
+			t.Fatal("unexpected discovery scan while idle")
+		}
+	}
+	assertIdle()
+	response := make(chan Response, 1)
+	go func() { response <- d.handleDiscover() }()
+	select {
+	case resp := <-response:
+		if !resp.OK {
+			t.Fatalf("requested discovery failed: %+v", resp)
+		}
+	case <-time.After(2 * scanDuration):
+		t.Fatal("requested discovery did not complete")
+	}
+	assertIdle()
+}
+
+func TestRunWaitsForStreamsBeforeReleasingInstanceLock(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")
+	d, err := New(Config{SocketPath: socketPath, CredFile: filepath.Join(t.TempDir(), "credentials.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.streamWorkers.Add(1)
+	workerDone := false
+	defer func() {
+		if !workerDone {
+			d.streamWorkers.Done()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	waitForDaemonSocket(t, socketPath)
+	cancel()
+
+	// A stream that is still unwinding must keep the daemon instance alive.
+	select {
+	case err := <-done:
+		t.Fatalf("Run exited before the stream completed: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if lock, err := acquireInstanceLock(socketPath); err == nil {
+		releaseInstanceLock(lock)
+		t.Fatal("daemon released the instance lock before the stream completed")
+	}
+	d.streamWorkers.Done()
+	workerDone = true
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not exit after the stream completed")
+	}
+	if _, err := os.Lstat(socketPath); !os.IsNotExist(err) {
+		t.Fatalf("socket remained after shutdown: %v", err)
+	}
+}
 
 func TestRunRejectsSecondDaemonWithoutRemovingLiveSocket(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")

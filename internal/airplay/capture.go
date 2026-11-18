@@ -29,7 +29,7 @@ import (
 type CaptureConfig struct {
 	FPS        int
 	Bitrate    int        // Video bitrate in kbps (0 = auto)
-	HWAccel    string     // "auto", "nvenc", "vaapi", "openh264", or "none"
+	HWAccel    string     // encoder preference accepted by ValidateHWAccel
 	VideoCodec VideoCodec // empty/h264, auto (resolved before Start), or hevc
 
 	// MaxWidth/MaxHeight select the encoded canvas advertised by the receiver.
@@ -51,10 +51,10 @@ type CaptureConfig struct {
 // zero-value CaptureConfig useful and is treated as auto.
 func ValidateHWAccel(method string) error {
 	switch method {
-	case "", "auto", "nvenc", "vaapi", "openh264", "none":
+	case "", "auto", "nvenc", "vaapi", "vaapi-legacy", "vaapi-legacy-quality", "openh264", "none":
 		return nil
 	default:
-		return fmt.Errorf("unknown encoder %q (want auto, nvenc, vaapi, openh264, or none)", method)
+		return fmt.Errorf("unknown encoder %q (want auto, nvenc, vaapi, vaapi-legacy, vaapi-legacy-quality, openh264, or none)", method)
 	}
 }
 
@@ -1981,6 +1981,21 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 
 	vbvBuf := vbvBufferKbit(bitrate, fps)
 	maxrate := bitrate + bitrate/4 // allow 25% overshoot on peaks
+	legacyMethod := "vaapi-legacy"
+	legacyLabel := "legacy VAAPI hardware encoding (vaapih264enc)"
+	legacyParts := []string{
+		"vaapih264enc",
+		fmt.Sprintf("bitrate=%d", bitrate),
+		fmt.Sprintf("keyframe-period=%d", keyframeInterval),
+		"max-bframes=0",
+		"rate-control=cbr",
+	}
+	if hwaccel == "vaapi-legacy-quality" {
+		legacyMethod = hwaccel
+		legacyLabel = "legacy VAAPI hardware encoding with CABAC and 8x8 transform (vaapih264enc)"
+		legacyParts = append(legacyParts, "cabac=true", "dct8x8=true")
+	}
+
 	candidates := []struct {
 		method  string
 		element string
@@ -2030,6 +2045,12 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 			}},
 		},
 		{
+			method:  legacyMethod,
+			element: "vaapih264enc",
+			label:   legacyLabel,
+			result:  encoderResult{rawFormat: "NV12", codec: VideoCodecH264, parts: legacyParts},
+		},
+		{
 			method:  "openh264",
 			element: "openh264enc",
 			label:   "OpenH264 software encoding (openh264enc)",
@@ -2063,6 +2084,11 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 	}
 
 	for _, candidate := range candidates {
+		// Legacy VA surfaces and properties differ from the modern VA path.
+		// Keep this encoder opt-in for systems such as Haswell with i965.
+		if hwaccel == "auto" && candidate.method == "vaapi-legacy" {
+			continue
+		}
 		if hwaccel != "auto" && hwaccel != candidate.method {
 			continue
 		}

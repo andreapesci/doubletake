@@ -351,11 +351,11 @@ func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 // ReadFrameAt reads one encoded audio frame and returns the source PTS of its
 // first sample. PTS is zero only for the transparent unframed fallback.
 func (ac *AudioCapture) ReadFrameAt(buf []byte) (int, time.Time, error) {
-	n, position, err := ac.readFramePosition(buf)
+	n, position, err := ac.readFramePosition(buf, false)
 	return n, position.PTS, err
 }
 
-func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePosition, error) {
+func (ac *AudioCapture) readFramePosition(buf []byte, muted bool) (int, audioPCMFramePosition, error) {
 	select {
 	case <-ac.waitCh:
 		if ac.waitErr != nil {
@@ -384,6 +384,9 @@ func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePositio
 	}
 	if err != nil {
 		return 0, audioPCMFramePosition{}, err
+	}
+	if muted {
+		clear(pcm)
 	}
 	if DebugMode() {
 		ac.recordPCMLevels(pcm)
@@ -1425,7 +1428,7 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 		default:
 		}
 
-		if _, _, err := capture.ReadFrameAt(prewarmBuf); err != nil {
+		if _, _, err := capture.readFramePosition(prewarmBuf, s.audioMuted.Load()); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -1460,7 +1463,7 @@ videoReady:
 	var firstFramePosition audioPCMFramePosition
 	catchupFrames := 0
 	for firstFrameSize == 0 {
-		firstFrameSize, firstFramePosition, err = capture.readFramePosition(frameBuf)
+		firstFrameSize, firstFramePosition, err = capture.readFramePosition(frameBuf, s.audioMuted.Load())
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -1636,7 +1639,7 @@ videoReady:
 		if usingFirstFrame {
 			useFirstFrame = false
 		} else {
-			n, framePosition, err = capture.readFramePosition(frameBuf)
+			n, framePosition, err = capture.readFramePosition(frameBuf, s.audioMuted.Load())
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()

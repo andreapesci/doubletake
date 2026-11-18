@@ -15,6 +15,13 @@ and manage multiple simultaneous mirroring sessions.
 .B status
 Query the status of the running doubletake daemon and list active connections
 .TP
+.B discover
+List available receivers after an mDNS scan. Starts a scan on request when
+the daemon uses \fB\-discover-on-demand\fR.
+.TP
+.B devices
+Return the cached receiver list immediately.
+.TP
 .B connect [\fITARGET\fR] [\fIPIN-OR-PASSWORD\fR]
 Connect to an Apple TV, optionally supplying pairing credentials. If no target
 is specified, connect to the first available discovered receiver
@@ -26,6 +33,10 @@ PIN or a configured receiver password. Exactly one receiver must be waiting;
 when multiple receivers are waiting, use
 .B connect \fITARGET\fR \fIPIN-OR-PASSWORD\fR
 to select one explicitly.
+.TP
+.B \-credential-stdin connect \fITARGET\fR
+Read the credential verbatim from standard input before connecting to the
+specified receiver. Send exactly the PIN or password, without a trailing newline.
 .TP
 .B disconnect [\fITARGET\fR]
 Disconnect from an Apple TV. If no target is specified, disconnects all active connections

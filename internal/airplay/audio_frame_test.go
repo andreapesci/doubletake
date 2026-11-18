@@ -115,7 +115,7 @@ func TestAudioCaptureTestToneCarriesSourcePTSWithoutHardware(t *testing.T) {
 	defer capture.Stop()
 
 	buf := make([]byte, 8192)
-	n, position, err := capture.readFramePosition(buf)
+	n, position, err := capture.readFramePosition(buf, false)
 	if err != nil {
 		t.Fatalf("read timestamped test-tone frame: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestAudioCaptureTestToneCarriesSourcePTSWithoutHardware(t *testing.T) {
 		t.Fatalf("first codec frame used %d RTP packets and %d samples, want one 352-sample source callback",
 			reader.reportPackets, reader.reportSamples)
 	}
-	_, second, err := capture.readFramePosition(buf)
+	_, second, err := capture.readFramePosition(buf, false)
 	if err != nil {
 		t.Fatalf("read second timestamped test-tone frame: %v", err)
 	}

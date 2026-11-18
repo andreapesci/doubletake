@@ -290,7 +290,7 @@ func TestStartGStreamerCommandSetsParentDeathSignal(t *testing.T) {
 }
 
 func TestValidateHWAccel(t *testing.T) {
-	for _, method := range []string{"", "auto", "nvenc", "vaapi", "openh264", "none"} {
+	for _, method := range []string{"", "auto", "nvenc", "vaapi", "vaapi-legacy", "vaapi-legacy-quality", "openh264", "none"} {
 		if err := ValidateHWAccel(method); err != nil {
 			t.Errorf("ValidateHWAccel(%q): %v", method, err)
 		}
@@ -803,11 +803,13 @@ func TestDetectGstEncoderRejectsMissingExplicitOpenH264(t *testing.T) {
 
 func TestDetectGstEncoderSelectionContract(t *testing.T) {
 	allProbes := []string{"vulkanh264enc", "nvh264enc", "vah264enc", "openh264enc", "x264enc"}
+	legacyParts := gstStage{"vaapih264enc", "bitrate=2500", "keyframe-period=60", "max-bframes=0", "rate-control=cbr"}
 	tests := []struct {
 		name        string
 		method      string
 		available   map[string]bool
 		wantEncoder string
+		wantParts   gstStage
 		wantMemory  encoderInputMemory
 		wantProbes  []string
 		wantError   string
@@ -815,7 +817,7 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 		{
 			name:        "auto falls through to OpenH264",
 			method:      "auto",
-			available:   map[string]bool{"openh264enc": true, "x264enc": true},
+			available:   map[string]bool{"vaapih264enc": true, "openh264enc": true, "x264enc": true},
 			wantEncoder: "openh264enc",
 			wantProbes:  allProbes[:4],
 		},
@@ -861,6 +863,29 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			wantError:  "vah264enc",
 		},
 		{
+			name:        "legacy VAAPI is selected explicitly",
+			method:      "vaapi-legacy",
+			available:   map[string]bool{"vah264enc": true, "vaapih264enc": true},
+			wantEncoder: "vaapih264enc",
+			wantParts:   legacyParts,
+			wantProbes:  []string{"vaapih264enc"},
+		},
+		{
+			name:        "legacy VAAPI quality only adds coding tools",
+			method:      "vaapi-legacy-quality",
+			available:   map[string]bool{"vah264enc": true, "vaapih264enc": true},
+			wantEncoder: "vaapih264enc",
+			wantParts:   append(append(gstStage(nil), legacyParts...), "cabac=true", "dct8x8=true"),
+			wantProbes:  []string{"vaapih264enc"},
+		},
+		{
+			name:       "missing legacy VAAPI reports its own element",
+			method:     "vaapi-legacy",
+			available:  map[string]bool{"vah264enc": true, "openh264enc": true},
+			wantProbes: []string{"vaapih264enc"},
+			wantError:  "vaapih264enc",
+		},
+		{
 			name:        "none forces x264",
 			method:      "none",
 			available:   map[string]bool{"openh264enc": true, "x264enc": true},
@@ -896,6 +921,9 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			}
 			if len(encoder.parts) == 0 || encoder.parts[0] != test.wantEncoder {
 				t.Fatalf("encoder = %#v, want %s", encoder, test.wantEncoder)
+			}
+			if test.wantParts != nil && !reflect.DeepEqual(encoder.parts, test.wantParts) {
+				t.Fatalf("encoder options = %v, want %v", encoder.parts, test.wantParts)
 			}
 			if encoder.inputMemory != test.wantMemory {
 				t.Fatalf("encoder input memory = %v, want %v", encoder.inputMemory, test.wantMemory)

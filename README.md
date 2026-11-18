@@ -16,6 +16,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 - In-process test receiver for hardware-free pairing and media-flow tests
 - Automatic connection-aware screen/audio latency policy with an optional `-target-latency-ms` override
 - KDE Plasma widget for quick access (see [plasmoid/](plasmoid/))
+- Cinnamon and XFCE tray for discovery, pairing, and mirroring (see [LMDE setup](docs/lmde-airplay.md))
 
 ## Requirements
 
@@ -71,11 +72,12 @@ These are devices that have been tested with doubletake. If there are devices no
 make
 ```
 
-This builds the three binaries into `bin/`:
+This builds the commands into `bin/`:
 
 - `bin/doubletake`
 - `bin/doubletake-ctl`
 - `bin/doubletake-test-receiver`
+- `bin/doubletake-tray` (requires Python 3 with GTK 3 introspection at runtime)
 
 ## Install
 
@@ -286,6 +288,10 @@ Only `-hwaccel auto` tries fallback encoders, in the order `vulkanh264enc`,
 `nvh264enc`, `vah264enc`, `openh264enc`, then `x264enc`. Explicit selections
 fail if their required GStreamer encoder is unavailable; `none` forces x264 for
 H.264 or x265 for explicitly requested HEVC.
+`-hwaccel vaapi-legacy` explicitly uses `vaapih264enc` for H.264 on systems
+such as Intel Haswell with the i965 driver.
+`-hwaccel vaapi-legacy-quality` uses the same encoder and bitrate with
+CABAC and the adaptive 8×8 transform enabled.
 The normal `-video-codec auto` path uses H.264 at the receiver's nominal canvas
 for compatibility across AirPlay receiver generations. Explicit
 `-video-codec hevc` remains available with `nvh265enc` or `x265enc`; use
@@ -309,8 +315,11 @@ doubletake-ctl unmute [target]
 ```
 
 - `disconnect` without a target stops all active streams.
+- `discover` waits for the ongoing mDNS scan, or starts one with
+  `-discover-on-demand`. `devices` returns the cache immediately.
 - `disconnect <target>` stops only that receiver.
-- `mute`/`unmute` can operate globally or per target.
+- `mute`/`unmute` can operate globally or per target. They mute the outgoing
+  audio while preserving the volume set on the receiver.
 - `pin` retains its historical command name, but submits whichever credential
   the daemon requests: an on-screen PIN or a configured password. It is
   targetless and therefore requires exactly one waiting receiver; use

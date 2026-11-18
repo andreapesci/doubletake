@@ -981,20 +981,6 @@ func TestModernAudioStreamFields(t *testing.T) {
 	}
 }
 
-func TestAudioVolumeBody(t *testing.T) {
-	for _, test := range []struct {
-		muted bool
-		want  string
-	}{
-		{want: "volume: 0.000000\r\n"},
-		{muted: true, want: "volume: -144.000000\r\n"},
-	} {
-		if got := string(audioVolumeBody(test.muted)); got != test.want {
-			t.Errorf("audioVolumeBody(%t) = %q, want %q", test.muted, got, test.want)
-		}
-	}
-}
-
 func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 	SetTargetLatency(0)
 	t.Cleanup(func() {
@@ -1014,9 +1000,7 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 	}
 }
 
-// A session that DOES carry audio must still set the receiver's volume, so the
-// -no-audio guard narrows that behaviour rather than removing it.
-func TestSetupMirrorWithAudioSetsReceiverVolume(t *testing.T) {
+func TestSetupMirrorWithAudioPreservesReceiverVolume(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		skipRecord bool
@@ -1038,18 +1022,13 @@ func TestSetupMirrorControlFirstRecordsAfterStreamSetup(t *testing.T) {
 	})
 }
 
-// A no-audio session must not be able to write the receiver's volume through
-// the daemon's mute control either: unmuting sends 0 dB, which is full scale.
 func TestSetAudioMutedRefusesWhenSessionHasNoAudio(t *testing.T) {
 	for _, muted := range []bool{true, false} {
-		session := &MirrorSession{client: &AirPlayClient{}, sessionURI: "rtsp://example/session", noAudio: true}
+		session := &MirrorSession{audioStream: &AudioStream{}, noAudio: true}
 		err := session.SetAudioMuted(muted)
 		if err == nil {
 			t.Fatalf("SetAudioMuted(%v) = nil, want a refusal for a no-audio session", muted)
 		}
-		// Assert the REASON, not merely that something failed: without the
-		// guard this call still errors (no connection), so an error alone
-		// would pass on the unfixed code.
 		if !strings.Contains(err.Error(), "audio disabled") {
 			t.Fatalf("SetAudioMuted(%v) error = %q, want a refusal naming the disabled audio", muted, err)
 		}
@@ -1342,10 +1321,8 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 					return
 				}
 			case "SET_PARAMETER":
-				if string(req.body) != "volume: 0.000000\r\n" {
-					serverErr <- fmt.Errorf("unexpected SET_PARAMETER body %q", string(req.body))
-					return
-				}
+				// Accept the old volume request so the exact sequence below
+				// can report any unexpected command without a socket timeout.
 				if err := writeRTSPTestResponse(conn, 200, nil, nil); err != nil {
 					serverErr <- err
 					return
@@ -1423,6 +1400,13 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 		t.Fatal("timed out waiting for immediate /feedback")
 	}
 
+	if !noAudio {
+		for _, muted := range []bool{true, false} {
+			if err := session.SetAudioMuted(muted); err != nil {
+				t.Fatalf("SetAudioMuted(%t): %v", muted, err)
+			}
+		}
+	}
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1432,12 +1416,6 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 	if !skipRecord {
 		recordIndex = len(wantMethods)
 		wantMethods = append(wantMethods, "RECORD")
-	}
-	// The two volume SET_PARAMETERs are sent only when the session carries
-	// audio: `volume: 0.000000` is 0 dB — full scale — so a video-only
-	// session would force the receiver to maximum.
-	if !noAudio {
-		wantMethods = append(wantMethods, "SET_PARAMETER", "SET_PARAMETER")
 	}
 	wantMethods = append(wantMethods, "POST", "TEARDOWN")
 	got := make([]rtspTestRequest, 0, len(wantMethods))

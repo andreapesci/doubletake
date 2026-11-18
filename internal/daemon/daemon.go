@@ -86,22 +86,23 @@ type DeviceInfo struct {
 
 // Config holds daemon configuration.
 type Config struct {
-	SocketPath  string
-	CredFile    string
-	CredBackend string
-	FPS         int
-	Bitrate     int
-	PortMin     int // inclusive local UDP port bound; zero with PortMax means ephemeral
-	PortMax     int // inclusive local UDP port bound; zero with PortMin means ephemeral
-	HWAccel     string
-	VideoCodec  airplay.VideoCodec
-	Debug       bool
-	TestMode    bool
-	NoEncrypt   bool
-	DirectKey   bool
-	NoAudio     bool
-	ShowCursor  bool
-	Code        string // default pairing/Digest credential; request Pin overrides it
+	DiscoverOnDemand bool
+	SocketPath       string
+	CredFile         string
+	CredBackend      string
+	FPS              int
+	Bitrate          int
+	PortMin          int // inclusive local UDP port bound; zero with PortMax means ephemeral
+	PortMax          int // inclusive local UDP port bound; zero with PortMin means ephemeral
+	HWAccel          string
+	VideoCodec       airplay.VideoCodec
+	Debug            bool
+	TestMode         bool
+	NoEncrypt        bool
+	DirectKey        bool
+	NoAudio          bool
+	ShowCursor       bool
+	Code             string // default pairing/Digest credential; request Pin overrides it
 }
 
 func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
@@ -316,10 +317,18 @@ type Daemon struct {
 	lastError       string                                 // most recent asynchronous stream failure
 	lastErrorTarget string                                 // target associated with lastError; empty for capture-wide errors
 
+	discoverCtx    context.Context
 	discoverCancel context.CancelFunc
+	discovery      *discoveryScan
 	listener       net.Listener
 	streamWorkers  sync.WaitGroup // stream, capture, and externally detached cleanup workers
+	shutdownOnce   sync.Once
 	shuttingDown   bool
+}
+
+type discoveryScan struct {
+	done chan struct{}
+	err  error
 }
 
 // New creates a new Daemon with the given configuration.
@@ -395,8 +404,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
-	// Start continuous mDNS discovery in the background
 	discoverCtx, discoverCancel := context.WithCancel(ctx)
+	var backgroundScan *discoveryScan
+	if !d.cfg.DiscoverOnDemand {
+		backgroundScan = &discoveryScan{done: make(chan struct{})}
+	}
 	d.mu.Lock()
 	if d.shuttingDown {
 		d.mu.Unlock()
@@ -405,14 +417,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return nil
 	}
 	d.listener = ln
+	d.discoverCtx = discoverCtx
 	d.discoverCancel = discoverCancel
+	d.discovery = backgroundScan
 	d.mu.Unlock()
+	defer d.Shutdown()
 
 	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
-	go d.backgroundDiscover(discoverCtx)
+	if backgroundScan != nil {
+		go d.backgroundDiscover(discoverCtx, backgroundScan)
+	}
 
 	go func() {
-		<-ctx.Done()
+		<-discoverCtx.Done()
 		ln.Close()
 	}()
 
@@ -437,9 +454,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 // Shutdown stops any active sessions and cleans up the socket.
 func (d *Daemon) Shutdown() {
+	d.shutdownOnce.Do(d.shutdown)
+}
+
+func (d *Daemon) shutdown() {
 	d.mu.Lock()
 	d.shuttingDown = true
 	discoverCancel := d.discoverCancel
+	d.discoverCtx = nil
 	d.discoverCancel = nil
 	listener := d.listener
 	d.listener = nil
@@ -458,65 +480,78 @@ func (d *Daemon) Shutdown() {
 	// detached cleanup may still be unwinding. Do not let them run into the next
 	// test or process lifecycle.
 	d.streamWorkers.Wait()
-	os.Remove(d.cfg.SocketPath)
 }
 
-// backgroundDiscover continuously browses mDNS for AirPlay devices.
-// Each scan runs for 5 seconds. Devices not seen for >30 seconds are removed.
-func (d *Daemon) backgroundDiscover(ctx context.Context) {
-	const (
-		scanDuration = 5 * time.Second
-		deviceTTL    = 30 * time.Second
-	)
+const scanDuration = 5 * time.Second
+
+func (d *Daemon) backgroundDiscover(ctx context.Context, scan *discoveryScan) {
 	log.Printf("[daemon] starting continuous mDNS discovery")
-	for {
+	for scan != nil {
+		next := d.runDiscoveryScan(ctx, scan)
+		if next != nil && scan.err != nil {
+			log.Printf("[daemon] mDNS browse error: %v", scan.err)
+			select {
+			case <-time.After(scanDuration):
+			case <-ctx.Done():
+			}
+		}
+		scan = next
+	}
+}
+
+func (d *Daemon) runDiscoveryScan(ctx context.Context, scan *discoveryScan) *discoveryScan {
+	var found []airplay.AirPlayDevice
+	err := ctx.Err()
+	if err == nil {
 		browseCtx, cancel := context.WithTimeout(ctx, scanDuration)
-		found, err := airplay.DiscoverAirPlayDevices(browseCtx)
+		found, err = airplay.DiscoverAirPlayDevices(browseCtx)
 		cancel()
+	}
 
-		if ctx.Err() != nil {
-			return
-		}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		d.updateDiscoveredDevices(found)
+	}
+	var next *discoveryScan
+	if !d.cfg.DiscoverOnDemand && ctx.Err() == nil {
+		next = &discoveryScan{done: make(chan struct{})}
+	}
+	d.discovery = next
+	scan.err = err
+	close(scan.done)
+	return next
+}
 
-		now := time.Now()
-		d.mu.Lock()
-		if err == nil {
-			// Build a map of currently known devices by IP for quick lookup
-			known := make(map[string]airplay.AirPlayDevice, len(d.devices))
-			for _, dev := range d.devices {
+// updateDiscoveredDevices replaces the list on demand, or retains recent
+// advertisements across consecutive background scans. The caller holds d.mu.
+func (d *Daemon) updateDiscoveredDevices(found []airplay.AirPlayDevice) {
+	const deviceTTL = 30 * time.Second
+	now := time.Now()
+	known := make(map[string]airplay.AirPlayDevice, len(d.devices)+len(found))
+	if !d.cfg.DiscoverOnDemand {
+		for _, dev := range d.devices {
+			if now.Sub(d.deviceLastSeen[dev.IP]) <= deviceTTL {
 				known[dev.IP] = dev
+			} else {
+				delete(d.deviceLastSeen, dev.IP)
 			}
-
-			// Update last-seen timestamps and merge new devices
-			for _, dev := range found {
-				d.deviceLastSeen[dev.IP] = now
-				known[dev.IP] = dev // add or update
-			}
-
-			// Rebuild device list, dropping anything older than TTL
-			devices := make([]airplay.AirPlayDevice, 0, len(known))
-			for ip, dev := range known {
-				if now.Sub(d.deviceLastSeen[ip]) <= deviceTTL {
-					devices = append(devices, dev)
-				} else {
-					delete(d.deviceLastSeen, ip)
-				}
-			}
-			d.devices = devices
-			sort.Slice(d.devices, func(i, j int) bool {
-				return d.devices[i].IP < d.devices[j].IP
-			})
-		}
-		d.mu.Unlock()
-		if err != nil {
-			log.Printf("[daemon] mDNS browse error: %v", err)
-		}
-
-		// Next scan starts immediately (no extra wait — the 5s scan is the cadence)
-		if ctx.Err() != nil {
-			return
 		}
 	}
+	for _, dev := range found {
+		if !d.cfg.DiscoverOnDemand {
+			d.deviceLastSeen[dev.IP] = now
+		}
+		known[dev.IP] = dev
+	}
+	d.devices = make([]airplay.AirPlayDevice, 0, len(known))
+	for _, dev := range known {
+		d.devices = append(d.devices, dev)
+	}
+	sort.Slice(d.devices, func(i, j int) bool { return d.devices[i].IP < d.devices[j].IP })
 }
 
 func (d *Daemon) handleConn(conn net.Conn) {
@@ -679,12 +714,28 @@ func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCred
 
 func (d *Daemon) handleDiscover() Response {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	return Response{
-		OK:      true,
-		State:   d.overallStateLocked(),
-		Devices: toDeviceInfos(d.devices),
+	scan := d.discovery
+	ctx := d.discoverCtx
+	if ctx == nil {
+		d.mu.Unlock()
+		return Response{OK: false, Error: "mDNS discovery is not running"}
 	}
+	if scan == nil {
+		scan = &discoveryScan{done: make(chan struct{})}
+		d.discovery = scan
+		d.streamWorkers.Add(1)
+		d.mu.Unlock()
+		defer d.streamWorkers.Done()
+		d.runDiscoveryScan(ctx, scan)
+	} else {
+		d.mu.Unlock()
+	}
+	// Share an in-flight scan with the background browser and other clients.
+	<-scan.done
+	if scan.err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("mDNS discovery: %v", scan.err)}
+	}
+	return d.handleDevices()
 }
 
 func (d *Daemon) handleDevices() Response {
@@ -1699,13 +1750,13 @@ func (d *Daemon) handleDisconnect(req Request) Response {
 
 func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	var targets []*activeStream
 	if req.Target != "" {
 		entry, ok := d.streams[req.Target]
 		if !ok {
 			state := d.overallStateLocked()
-			d.mu.Unlock()
 			return Response{OK: false, State: state, Error: "no active stream to " + req.Target}
 		}
 		targets = []*activeStream{entry}
@@ -1718,36 +1769,20 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 	}
 
 	if len(targets) == 0 {
-		resp := d.statusResponseLocked(false, "not currently streaming")
-		d.mu.Unlock()
-		return resp
+		return d.statusResponseLocked(false, "not currently streaming")
 	}
-
-	sessions := make([]*airplay.MirrorSession, 0, len(targets))
-	for _, t := range targets {
-		if t.session != nil && (d.cfg.NoAudio || t.session.HasAudio()) {
-			sessions = append(sessions, t.session)
-		}
-	}
-	d.mu.Unlock()
 
 	var lastErr error
-	for _, s := range sessions {
-		if err := s.SetAudioMuted(muted); err != nil {
+	for _, target := range targets {
+		if err := target.session.SetAudioMuted(muted); err != nil {
 			lastErr = err
+			continue
 		}
+		target.audioMuted = muted
 	}
 	if lastErr != nil {
-		d.mu.Lock()
-		defer d.mu.Unlock()
 		return d.statusResponseLocked(false, "failed to update audio mute state: "+lastErr.Error())
 	}
-
-	d.mu.Lock()
-	for _, t := range targets {
-		t.audioMuted = muted
-	}
-	defer d.mu.Unlock()
 	return d.statusResponseLocked(true, "")
 }
 

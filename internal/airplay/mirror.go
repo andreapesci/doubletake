@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -244,6 +245,7 @@ type MirrorSession struct {
 	// Audio
 	audioStream *AudioStream
 	noAudio     bool
+	audioMuted  atomic.Bool
 }
 
 func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
@@ -614,9 +616,8 @@ func (c *AirPlayClient) setupMirrorSessionOnce(ctx context.Context, cfg StreamCo
 
 	audioStreamConnectionID := int64(time.Now().UnixNano() & 0x7FFFFFFFFFFFFFFF)
 	selectedAudioCodec := policy.audioCodec
-	// Use streamConnectionID as the RTSP URI path. Control, audio, RECORD, and
-	// SET_PARAMETER share the audio URI; video uses a separate URI with its own
-	// streamConnectionID.
+	// Control, audio SETUP, and RECORD share the audio URI. Video uses a
+	// separate URI with its own streamConnectionID.
 	audioURI := fmt.Sprintf("rtsp://%s:%d/%d", c.host, c.port, audioStreamConnectionID)
 	audioMode := policy.audioSecurity
 	var audioKey, audioIV, audioChaChaKey []byte
@@ -1137,33 +1138,6 @@ func (c *AirPlayClient) setupMirrorSessionOnce(ctx context.Context, cfg StreamCo
 		dbg("[SETUP] receiver returned skipRecord=true; session was started by SETUP")
 	} else if err := recordSession(); err != nil {
 		return nil, err
-	}
-
-	// Only set the receiver's volume when this session actually carries audio.
-	// `volume: 0.000000` is 0 dB — full scale in AirPlay, not silence — so a
-	// video-only session would force the receiver to maximum on every connect.
-	// Sending -144 instead would be equally destructive of the user's setting;
-	// a session that transmits no audio has no use for the receiver's audio
-	// state and should leave its volume untouched.
-	if cfg.NoAudio {
-		dbg("[SETUP] no-audio session: skipping SET_PARAMETER volume")
-	} else {
-		// Positive dB values are invalid here and current receivers may
-		// interpret them as zero gain. Real senders send the sender's own
-		// slider value; 0 dB is this sender's fixed choice.
-		volumeBody := audioVolumeBody(false)
-		if _, _, err := setupRTSPRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil); err != nil {
-			if !controlConnectionUsable {
-				return nil, fmt.Errorf("SET_PARAMETER volume: %w", err)
-			}
-			dbg("[SETUP] SET_PARAMETER volume failed (non-fatal): %v", err)
-		} else {
-			dbg("[SETUP] SET_PARAMETER volume=0 sent")
-		}
-		// Send volume twice (pcap shows real senders do this)
-		if _, _, err := setupRTSPRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil); err != nil && !controlConnectionUsable {
-			return nil, fmt.Errorf("repeat SET_PARAMETER volume: %w", err)
-		}
 	}
 
 	if timingProtocol == timingProtocolPTP {
@@ -2435,32 +2409,20 @@ func (s *MirrorSession) HasAudio() bool {
 	return s.audioStream != nil
 }
 
-// SetAudioMuted updates mirrored audio volume on the receiver.
-// AirPlay uses SET_PARAMETER volume where 0 dB is max and -144 dB is muted.
+// SetAudioMuted silences the PCM sent by this session, preserving the receiver's
+// volume and the negotiated audio stream.
 func (s *MirrorSession) SetAudioMuted(muted bool) error {
-	if s == nil || s.client == nil || s.sessionURI == "" {
+	if s == nil {
 		return fmt.Errorf("audio control unavailable")
 	}
-	// A session started with audio disabled must not write the receiver's
-	// volume either: unmuting sends 0 dB — full scale — which would discard
-	// whatever the user had set, exactly as the setup path once did. The
-	// session negotiates an audio stream even in this mode, so HasAudio() is
-	// not sufficient to tell the two apart.
 	if s.noAudio {
 		return fmt.Errorf("audio control unavailable: session was started with audio disabled")
 	}
-
-	if _, _, err := s.client.rtspRequest("SET_PARAMETER", s.sessionURI, "text/parameters", audioVolumeBody(muted), nil); err != nil {
-		return fmt.Errorf("set audio muted=%t: %w", muted, err)
+	if !s.HasAudio() {
+		return fmt.Errorf("audio control unavailable: no audio stream")
 	}
+	s.audioMuted.Store(muted)
 	return nil
-}
-
-func audioVolumeBody(muted bool) []byte {
-	if muted {
-		return []byte("volume: -144.000000\r\n")
-	}
-	return []byte("volume: 0.000000\r\n")
 }
 
 // AudioStream returns the audio stream for this session (may be nil).

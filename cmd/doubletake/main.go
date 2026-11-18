@@ -67,7 +67,7 @@ func main() {
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic connection profile)")
-	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, openh264, none (x264/x265)")
+	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, vaapi-legacy, vaapi-legacy-quality, openh264, none (x264/x265)")
 	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses H.264 for receiver compatibility)")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
@@ -76,6 +76,7 @@ func main() {
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
+	discoverOnDemand := flag.Bool("discover-on-demand", false, "In daemon mode, browse for receivers only on a discover request")
 	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Unix socket path for daemon control interface")
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
@@ -104,22 +105,23 @@ func main() {
 
 	if *daemonize {
 		runDaemon(daemon.Config{
-			SocketPath:  *socketPath,
-			CredFile:    *credFile,
-			CredBackend: *credBackend,
-			FPS:         *fps,
-			Bitrate:     *bitrate,
-			PortMin:     portMin,
-			PortMax:     portMax,
-			HWAccel:     *hwaccel,
-			VideoCodec:  airplay.VideoCodec(*videoCodec),
-			Debug:       *debug,
-			TestMode:    *testMode,
-			NoEncrypt:   *noEncrypt,
-			DirectKey:   *directKey,
-			NoAudio:     *noAudio,
-			ShowCursor:  !*noCursor,
-			Code:        credential,
+			SocketPath:       *socketPath,
+			DiscoverOnDemand: *discoverOnDemand,
+			CredFile:         *credFile,
+			CredBackend:      *credBackend,
+			FPS:              *fps,
+			Bitrate:          *bitrate,
+			PortMin:          portMin,
+			PortMax:          portMax,
+			HWAccel:          *hwaccel,
+			VideoCodec:       airplay.VideoCodec(*videoCodec),
+			Debug:            *debug,
+			TestMode:         *testMode,
+			NoEncrypt:        *noEncrypt,
+			DirectKey:        *directKey,
+			NoAudio:          *noAudio,
+			ShowCursor:       !*noCursor,
+			Code:             credential,
 		})
 		return
 	}
@@ -646,7 +648,6 @@ func runDaemon(cfg daemon.Config) {
 		<-sigCh
 		log.Println("[daemon] shutting down...")
 		cancel()
-		d.Shutdown()
 		<-sigCh
 		log.Println("[daemon] forced exit")
 		os.Exit(1)
