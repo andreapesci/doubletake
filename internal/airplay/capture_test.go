@@ -1643,3 +1643,50 @@ func TestH264TestCaptureStartupProbePreservesRealGStreamerOutput(t *testing.T) {
 		}
 	}
 }
+
+func TestCanUseVAAPIPostprocOnlyWithoutLetterboxing(t *testing.T) {
+	legacy := encoderResult{rawFormat: "NV12", vaapiSurfaceInput: true}
+	all := func(string) bool { return true }
+	for _, test := range []struct {
+		name                       string
+		encoder                    encoderResult
+		captureW, captureH, mw, mh int
+		hasElement                 func(string) bool
+		want                       bool
+	}{
+		{name: "same 16:9 aspect", encoder: legacy, captureW: 1920, captureH: 1080, mw: 1920, mh: 1080, hasElement: all, want: true},
+		{name: "downscale keeps aspect", encoder: legacy, captureW: 2560, captureH: 1440, mw: 1920, mh: 1080, hasElement: all, want: true},
+		{name: "no receiver limit", encoder: legacy, captureW: 2560, captureH: 1600, hasElement: all, want: true},
+		{name: "16:10 needs borders", encoder: legacy, captureW: 2560, captureH: 1600, mw: 1920, mh: 1080, hasElement: all},
+		{name: "unknown capture size", encoder: legacy, mw: 1920, mh: 1080, hasElement: all},
+		{name: "other encoder", encoder: encoderResult{rawFormat: "NV12"}, captureW: 1920, captureH: 1080, mw: 1920, mh: 1080, hasElement: all},
+		{name: "missing vaapipostproc", encoder: legacy, captureW: 1920, captureH: 1080, mw: 1920, mh: 1080,
+			hasElement: func(name string) bool { return name != "vaapipostproc" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := canUseVAAPIPostproc(test.encoder, test.captureW, test.captureH, test.mw, test.mh, test.hasElement); got != test.want {
+				t.Fatalf("canUseVAAPIPostproc = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildVAAPIPostprocVideoPipeline(t *testing.T) {
+	encoder := encoderResult{parts: gstStage{"vaapih264enc", "bitrate=6000"}, rawFormat: "NV12", vaapiSurfaceInput: true}
+	got := buildVAAPIPostprocVideoPipeline(
+		gstStage{"ximagesrc"}, []gstStage{frameRateStage(30)}, encoder, 1920, 1080, false,
+	)
+	want := []string{
+		"--quiet", "ximagesrc",
+		"!", "video/x-raw,framerate=30/1",
+		"!", "vaapipostproc",
+		"!", "video/x-raw(memory:VASurface),format=NV12,width=1920,height=1080,pixel-aspect-ratio=1/1",
+		"!", "vaapih264enc", "bitrate=6000",
+		"!", "h264parse", "config-interval=-1",
+		"!", "video/x-h264,stream-format=byte-stream,alignment=au",
+		"!", "fdsink", "fd=1", "sync=false", "async=false",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("VAAPI postproc pipeline = %v, want %v", got, want)
+	}
+}

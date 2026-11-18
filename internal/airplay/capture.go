@@ -815,6 +815,10 @@ type encoderResult struct {
 	rawFormat   string // raw format accepted by the encoder
 	codec       VideoCodec
 	inputMemory encoderInputMemory
+	// vaapiSurfaceInput marks a gstreamer-vaapi encoder that accepts
+	// vaapipostproc's VASurface output, so X11 capture can convert colors on
+	// the GPU instead of with videoconvert.
+	vaapiSurfaceInput bool
 }
 
 type waylandPipelineMode uint8
@@ -967,6 +971,38 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
 	if encoder.needsVulkan {
 		args = appendGstStage(args, gstStage{"vulkanupload"})
 	}
+	return appendGstVideoEncoding(args, encoder, timestampedOutput)
+}
+
+// canUseVAAPIPostproc reports whether a captured frame can be converted, and
+// scaled if needed, by vaapipostproc. Converting a 1080p desktop to NV12 with
+// videoconvert costs about as much CPU as the rest of the pipeline on older
+// Intel laptops. vaapipostproc stretches instead of adding borders, so it is
+// used only when the capture already has the receiver's aspect ratio.
+func canUseVAAPIPostproc(encoder encoderResult, captureWidth, captureHeight, maxWidth, maxHeight int, hasElement func(string) bool) bool {
+	if !encoder.vaapiSurfaceInput || captureWidth <= 0 || captureHeight <= 0 ||
+		hasElement == nil || !hasElement("vaapipostproc") {
+		return false
+	}
+	if maxWidth <= 0 || maxHeight <= 0 {
+		return true
+	}
+	return captureWidth*(maxHeight&^1) == captureHeight*(maxWidth&^1)
+}
+
+// buildVAAPIPostprocVideoPipeline uploads captured frames once and keeps color
+// conversion, scaling, and encoding on the GPU.
+func buildVAAPIPostprocVideoPipeline(source gstStage, beforeConvert []gstStage, encoder encoderResult, maxWidth, maxHeight int, timestampedOutput bool) []string {
+	args := append([]string{"--quiet"}, source...)
+	for _, stage := range beforeConvert {
+		args = appendGstStage(args, stage)
+	}
+	args = appendGstStage(args, gstStage{"vaapipostproc"})
+	caps := fmt.Sprintf("video/x-raw(memory:VASurface),format=%s", encoder.rawFormat)
+	if maxWidth > 1 && maxHeight > 1 {
+		caps += fmt.Sprintf(",width=%d,height=%d,pixel-aspect-ratio=1/1", maxWidth&^1, maxHeight&^1)
+	}
+	args = appendGstStage(args, gstStage{caps})
 	return appendGstVideoEncoding(args, encoder, timestampedOutput)
 }
 
@@ -1685,6 +1721,7 @@ func startPreparedX11Capture(startupCtx, lifetimeCtx context.Context, cfg Captur
 	}
 
 	display := os.Getenv("DISPLAY")
+	captureWidth, captureHeight := 0, 0
 
 	ximageSrcArgs := gstStage{
 		"ximagesrc",
@@ -1712,6 +1749,7 @@ func startPreparedX11Capture(startupCtx, lifetimeCtx context.Context, cfg Captur
 				fmt.Sprintf("endx=%d", endX-1),
 				fmt.Sprintf("endy=%d", endY-1),
 			)
+			captureWidth, captureHeight = endX-startX, endY-startY
 			dbg("[CAPTURE] cropping ximagesrc to x=%d..%d y=%d..%d", startX, endX-1, startY, endY-1)
 		}
 	}
@@ -1721,7 +1759,13 @@ func startPreparedX11Capture(startupCtx, lifetimeCtx context.Context, cfg Captur
 	}
 
 	beforeConvert := []gstStage{frameRateStage(fps), lowLatencyVideoQueueStage()}
-	gstArgs := buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+	var gstArgs []string
+	if canUseVAAPIPostproc(encoder, captureWidth, captureHeight, cfg.MaxWidth, cfg.MaxHeight, hasGstElement) {
+		log.Printf("[CAPTURE] converting %dx%d X11 frames on the GPU (vaapipostproc)", captureWidth, captureHeight)
+		gstArgs = buildVAAPIPostprocVideoPipeline(ximageSrcArgs, beforeConvert, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+	} else {
+		gstArgs = buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+	}
 
 	dbg("[CAPTURE] gst-launch-1.0 (x11) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -2048,7 +2092,7 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 			method:  legacyMethod,
 			element: "vaapih264enc",
 			label:   legacyLabel,
-			result:  encoderResult{rawFormat: "NV12", codec: VideoCodecH264, parts: legacyParts},
+			result:  encoderResult{rawFormat: "NV12", codec: VideoCodecH264, parts: legacyParts, vaapiSurfaceInput: true},
 		},
 		{
 			method:  "openh264",
